@@ -1,0 +1,37 @@
+.SettingsPanel {
+  // Hide the close button
+  div[role='dialog'] {
+    > button {
+      opacity: 0;
+    }
+  }
+
+  // Hide the audio selector
+  div[class*='_deviceListWrapper_'] > div:nth-child(2) {
+    display: none;
+  }
+
+  h5 {
+    font-size: 1em;
+    margin-top: 1em;
+    margin-bottom: 1em;
+  }
+
+  .effect-list {
+    display: flex;
+    gap: 0.5em;
+  }
+}
+
+@media (max-height: 600px) {
+  .SettingsPanel {
+    width: 256px !important;
+  }
+}
+
+.settings-version {
+  margin: 0.75rem 0 0.25rem;
+  font-size: 0.7rem;
+  opacity: 0.6;
+  text-align: right;
+}

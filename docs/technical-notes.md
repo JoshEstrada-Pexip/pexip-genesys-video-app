@@ -2,7 +2,7 @@
 
 Engineering notes for every behavioural change since the 1.0.0 baseline
 (July 2026): the defect, the cause, what changed in the code, and how it was
-verified. Section numbers (§1 … §17) are referenced by commit messages and by
+verified. Section numbers (§1 … §20) are referenced by commit messages and by
 `CHANGELOG.md`.
 
 Conventions:
@@ -866,3 +866,204 @@ checked 2026-09-10): identical `callType` argument, identical
 `@pexip/infinity` 23.0.0, `handleRemoteStream` passes the stream straight
 to state, and its remote `<Video>` has no `muted`. Worth reporting to
 Pexip alongside the SDK behaviour.
+
+## 18. Consult: video resumes when the agent goes back to the member (2026-10-01)
+
+**Problem (field report).** An agent on video with a member starts a consult
+to another agent's video extension or a Genesys contact. The member goes on
+hold and video mutes, as designed. The target answers (audio only). The
+agent goes back to the member and video does not resume.
+
+**Reproduced (lab S3.6).** Consult to an external number, answered; then the
+agent speaks to the member with the consult still up
+(`PATCH …/consult {speakTo: 'OBJECT'}`). Before the fix: 0 kbps on the wire
+and the pane stuck on "Consulting — customer on hold" for the whole stage.
+Video came back only when the consult target left.
+
+**What Genesys sends.** During an answered consult nobody's `held` changes
+and the consult flags (`consultParticipantId` on every party,
+`attributes.consultInitiator` on the agent) stay set until the consult
+ends. Who the agent is speaking to shows only in `confined`:
+
+| Stage | member | agent (initiator) | consult target |
+|---|---|---|---|
+| agent speaks to the target | `confined: true` | unchanged | `confined: false` |
+| agent speaks to the member | `confined: false` | unchanged | `confined: true` |
+| target leaves | consult flags cleared | consult flags cleared | disconnected |
+
+A switch arrives as two events about 300 ms apart, with a transient where
+neither leg is confined. `consultParticipantId` is the member's participant
+id on every leg.
+
+**Cause.** The hold rule un-held a consulting agent only when a connected
+**agent-purpose** leg was confined. A consult target reached by number
+(extension, external contact) is a far-end leg — `purpose: 'customer'` in
+the lab, the same purpose as the member — so its `confined` flag was never
+looked at. Agent-to-agent consults already worked.
+
+**Fix** (`src/genesys/genesysService.ts`, `callsCallback`). Same rule, with
+the consult parties identified by role instead of purpose:
+
+```ts
+const consultSubject =
+  participants?.find(
+    (participant) =>
+      participant.id != null &&
+      participant.id === agentParticipant?.consultParticipantId
+  ) ?? customerParticipant
+const consultPartyConfined = participants?.find(
+  (participant) =>
+    participant.state === GenesysConnectionsState.Connected &&
+    participant !== consultSubject &&
+    participant.confined === true
+)
+const effectiveHoldState =
+  isConsulting &&
+  (consultPartyConfined == null || consultSubject?.confined === true)
+    ? true
+    : (agentParticipant?.held ?? false)
+```
+
+Held for the whole consult except while the member is not confined AND
+another consult party is parked. Both conditions are required so each
+transient fails toward muted: going to the member, video waits for the
+second event (then the 750 ms settle of §2); going to the target, the first
+event of either kind mutes immediately. Nothing else changed: the privacy
+rule (§1), the settle window (§2), the panes (§11) and the App side are
+untouched.
+
+**Verification.**
+
+- Replay test: four real S3.6 snapshots added to
+  `src/genesys/__fixtures__/replay-snapshots.json`
+  (`consultExternalActive`, `consultBackWithMember`,
+  `consultWithTargetAgain`, `consultTargetGone`) and pushed through the real
+  service and App. Four unit tests for the rule, including both transients.
+  Two of the new tests failed before the fix. 179 tests pass; TypeScript and
+  lint clean.
+- Wire, fixed build, 2026-10-02 (UTC):
+
+| Scenario | consult active | back with member | with target again | target gone |
+|---|---|---|---|---|
+| S3.6 external target, before fix | 0 kbps | **0 kbps** | 0 kbps | 374 kbps |
+| S3.6 external target, fixed | 0 kbps | **373 kbps** | 0 kbps | 382 kbps |
+| S3.7 agent target (A2 answered), fixed | 0 kbps | 389 kbps | 0 kbps | 395 kbps |
+
+  Latency in S3.6: video restored 1.6 s after "speak to member" (two events
+  plus the settle window); muted 0.6 s after "speak to target".
+- Regressions re-run live on the fixed build: S2.1 hold/unhold (0 kbps held,
+  375 kbps after) and S3.1 consult start/cancel (0 kbps, 379 kbps after).
+
+**Not changed, still open.**
+
+- A consult target reached by number has the member's purpose, so
+  `customerLegGone` waits for it too: if the member hangs up during an
+  answered external consult, the Genesys path does not end the call. The
+  Infinity roster path (§12) does.
+- Conference (speak to both) is still not defined; neither leg is confined,
+  so video stays muted for the initiator.
+
+## 19. Reload and reconnect in the middle of a consult or hold (2026-10-02)
+
+Three defects on the path the widget takes when it reads call state from
+REST instead of events (join, reload, rejoin, socket reconnect). All three
+were found with lab S3.8: an answered consult to an external number, then a
+widget reload, a notifications-socket kill, a switch back to the member and
+a second reload.
+
+**19.1 Two copies of the hold rule.** `getMyCallState` read `held` off the
+agent's own call, which Genesys leaves `false` for the whole consult, so a
+reload mid-consult settled "not held" while the member was on hold. The
+rule of §18 moved to `src/call/holdState.ts` (`deriveHoldState`), which
+reads both API shapes (events carry `state/held/confined` on the
+participant, REST on `calls[]`); the event path and the REST read both call
+it. The REST read also updates the service's own copy of the state: the app
+applies what the read returns, and without that the next un-hold event
+compared equal to a stale "not held" and was swallowed. `getHoldReason()`
+lets the pane say "Consulting" after a reload.
+
+**19.2 Wrong room after a consult to a branch-range number.**
+`fetchOutboundAlias` took ANY far-end leg marked outbound. A consult to a
+number adds such a leg and it stays in the participant list after it
+leaves. On an inbound call, a reload then resolved the room as outbound
+`30006`, dialed the device, and ended in the error panel
+(`S3_8-2026-10-02T15-28-11-175Z`). Now only the call's original far end —
+the first far-end participant — decides inbound vs outbound.
+
+**19.3 Camera kept sending after joining into a hold.**
+`handleCameraMuteChanged` stopped `localStream` from React state. Called
+from the join (and from any listener whose closure predates the stream)
+that state is still `undefined`: Infinity was told video was muted, the
+pane showed, the log said `video-muted confirmed`, and the camera track kept
+sending at ~370 kbps; the state was then cleared, so nothing could stop the
+stream later. It now stops `localStreamRef.current`, which is set where the
+stream is created. Normal hold was never affected (its listener closure had
+the stream). This predates §18: a reload during a plain hold did the same.
+
+**Verification.**
+
+- Unit: `src/call/holdState.test.ts` runs the rule over every recorded
+  event snapshot and two REAL REST snapshots from S3.8
+  (`src/genesys/__fixtures__/rest-consult-snapshots.json`); service tests
+  for the REST read mid-consult, the un-hold after a held read, and the
+  alias; `src/App.heldJoin.test.tsx` joins an already-held call and asserts
+  the camera track is stopped (fails without 19.3). 199 tests pass;
+  TypeScript and lint clean.
+- Live, 19.1 + 19.2 (`S3_8-2026-10-02T15-34-12-241Z`): after the mid-consult
+  reload `bootstrap-call-state held:true`, room `inbound app_31101_…`,
+  consult pane, `video-muted` 1.0 s after join; socket kill → lost →
+  restored with `held:true`, pane stays; speak to member → `video-restored`
+  in 1.6 s, 373 kbps; reload while with the member → live 370 kbps; no
+  `device-dial`, no error panel. Reload after transfer-back
+  (`S4_6-2026-10-02T15-38-02-222Z`): live 371 kbps.
+- Live, 19.3 (`S3_8-2026-10-02T15-46-50-820Z`, all three fixes): 0 kbps
+  after the mid-consult reload and 0 kbps after the socket reconnect (the
+  run before the fix measured 373 and 395 kbps there); 388 kbps back with
+  the member, 375 kbps after the second reload, 394 kbps after the target
+  left. All `wire.*` and `ui.*` rows pass.
+- Not run live: an outbound branch call after 19.2 (the lab outbound test
+  needs a person to dial from the workspace).
+
+## 20. Hold-video (playback) leg leaves when the agent's video joins (2026-10-02)
+
+**Intended behaviour.** For queue aliases that have one, the Infinity policy
+dials a Media Playback Service into the room when the customer's call
+creates it, and the customer watches a loop until an agent answers. The
+playback leg must then leave. The policy only dials it at room creation, so
+holds, consults and transfers never bring it back.
+
+**Problem.** The widget had a handler for this and it never fired. It
+listened to `onParticipantJoined`, and `@pexip/infinity` raises that signal
+only for participants that arrive AFTER the roster sync. The playback leg is
+in the room before the agent, so it arrives inside the sync. A lab run on
+`31100` from 2026-09-08 shows the leg in the room for the whole call and no
+kick request from the widget.
+
+**Fix.** `src/call/playbackLeg.ts`: a playback leg is a SIP participant
+whose alias local part ends in `.playback` (e.g. `rbfcu.playback@<domain>`).
+`removePlaybackLegs` in `src/App.tsx` checks the whole roster once the join
+has settled and again on every roster change, and kicks any such leg — the
+same pattern and the same kick as the ghost-leg eviction of §12. A leg that
+is gone stays marked so it is not kicked twice while the roster still lists
+it; a failed kick is retried on the next roster change.
+`remainingCounterparties` no longer counts a playback leg, so a leg that
+could not be removed cannot keep the call open after the customer leaves.
+Infinity policy is unchanged.
+
+**Verification.**
+
+- Unit: `src/call/playbackLeg.test.ts`; App tests for a leg present at join,
+  a leg arriving after the join, no second kick, and customer hang-up with
+  the leg still present. 208 tests pass; TypeScript and lint clean.
+- Live on `31100` (2026-10-02): playback leg in the room before the agent
+  (`RBFCU Genesys playback`), one kick 1.4 s after `join-start`, gone from
+  the Infinity roster afterwards. Hold/unhold on the same call 0 → 388 kbps
+  (`S2_1-2026-10-02T16-44-51-564Z`); consult round trip to an external
+  target 0 / 388 / 0 / 391 kbps and the leg did not return
+  (`S3_6-2026-10-02T16-47-44-463Z`).
+- Also on `31100`: transfer away and back, then a reload
+  (`S4_6-2026-10-02T19-48-42-089Z`), and reload / socket loss mid-consult
+  (`S3_8-2026-10-02T19-50-58-835Z`). The leg was removed once per call and
+  did not return.
+- If the widget cannot join (camera blocked, another window owns the
+  video), the playback leg stays and the customer keeps seeing the loop.
